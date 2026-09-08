@@ -2,91 +2,161 @@
 
 <br>
 
-### Description:
+## Description:
 
-**call me maybe** convierte peticiones en lenguaje natural en llamadas a funciones
-estructuradas (JSON), usando un LLM pequeño (Qwen3-0.6B) combinado con
-decodificación restringida. El modelo **no responde la pregunta**, sino que
-**identifica qué función llamar y con qué argumentos**.
+**call me maybe** converts natural language requests into structured function calls
+(JSON), using a small LLM (Qwen3-0.6B) combined with **constrained decoding**. The
+model **does not answer the question**; it **identifies which function to call and
+with which arguments**. The LLM is used as a semantic-inference engine, not as a
+chatbot.
 
-### Instrucciones del LLM:
+The answer is a JSON object with a fixed shape:
 
-El LLM recibe el prompt del usuario y genera una secuencia de tokens que forma
-un JSON con la estructura: `{"fn_name": "...", "args": {...}}`. No se usa como
-chatbot o autocompletado — se usa como un **motor de procesamiento semántico**:
-dado lenguaje natural, decide qué nombre de función corresponde a la consulta que se la ha pasado y qué argumentos son
-los correspondientes a los pasados a esa función.
-
-La **decodificación restringida** fuerza al modelo a que cada token generado
-forme parte del JSON esperado. En cada paso, los tokens que no cumplen la
-gramática reciben `-inf` en sus logits, haciendo imposible que el modelo los
-elija. Así se garantiza JSON 100% válido incluso con un modelo de 500M
-parámetros.
-
-### Instrucciones:
-
-
-
-### Resources:
-
-https://www.geeksforgeeks.org/python/json-loads-in-python/
-https://www.geeksforgeeks.org/python/json-load-in-python/
-
-
-#### Configuración de mypy para llm_sdk:
-El flag `--ignore-missing-imports` del Makefile **no** cubre el error `attr-defined`
-("Module llm_sdk has no attribute Small_LLM_Model"): ese flag solo ignora módulos
-que no existen en el filesystem. Como `llm_sdk` sí existe pero no tiene anotaciones
-de tipos, mypy no encuentra el atributo. La solución está en `pyproject.toml`:
-
-- `mypy_path = "llm_sdk"` → apunta al paquete real (`llm_sdk/llm_sdk/`)
-- `[[tool.mypy.overrides]]` con `module = "llm_sdk"`, `ignore_errors = true` y
-  `follow_imports = "skip"` → ignora errores dentro del módulo y evita que mypy
-  analice `torch`/`transformers` (lo que ralentizaba o colgaba el análisis).
-  El SDK no se modifica.
-
-
-
-#### LLM_SDK:
-The package of the LLM (Large Language Model) used [Qwen 0.6B] contains the following key features:
-
-**1.  encode(texto)** → Convierte el texto input a tokens (números de IDs que el modelo entiende). Se usa una vez al principio para convertir el prompt en IDs. Devuelve un listado de la conversión de cada palabra a su ID del token correspondiente.
-
-**2.  get_logits_from_input_ids(lista de tokens)** → El modelo procesa los IDs y devuelve un vector de ~150,000 logits o elementos float. Son puntuaciones crudas de cuán probable es que la siguiente palabra se adecúe al contexto de lo anterior. Cada elemento del vector representa cada token del vocabulario en sus probabilidades de ser el siguiente elemento. Se usa en cada análisis durante el loop de generación.
-
-**3. decode(lista de tokens)** → Convierte los tokens que se han filtrado y recopilado en la última respuesta para pasarlo de vuelta a texto legible. Se usa una vez al final, cuando termina la generación.
-
-**4. get_path_to_vocab_file()** → Devuelve la ruta al archivo `vocab.json` del
-tokenizer (se descarga de Hugging Face). Ese archivo es un diccionario JSON que
-mapea **cada token (texto) a su ID numérico**. Es clave para el logit masking:
-permite saber, por ejemplo, cuáles son los IDs de los dígitos `0-9`, de `true`/
-`false`, o de los delimitadores (`{`, `}`, `,`, `"`, espacio), sin tener que
-adivinarlos con `encode`/`decode`. Ejemplo de uso:
-
-```python
-import json
-path = model.get_path_to_vocab_file()
-with open(path) as f:
-    vocab = json.load(f)      # dict {texto: ID}
-id_true  = vocab["true"]      # 1866
-id_false = vocab["false"]     # 3849
+```json
+{"fn_name": "...", "args": {...}}
 ```
 
-> **Detalle importante:** `file.read()` devuelve un **string**, no un
-> diccionario. Para poder acceder por clave (`vocab["true"]`) hay que
-> convertirlo: o bien usar `json.load(archivo)` (lee el archivo directamente),
-> o bien `json.loads(archivo.read())`. Ambos hacen lo mismo; la diferencia
-> está en si ya tienes el string o directamente el archivo.
+## How it works:
 
-### Algorithm:
+The LLM receives the user prompt and generates a token sequence that forms the JSON
+above. It is not used for free-form generation: given a natural-language request, it
+decides which function name matches the query and which arguments match the values
+passed to that function.
 
+**Constrained decoding** forces the model so that every generated token is part of the
+expected JSON grammar. At each step, tokens that do not satisfy the grammar get `-inf`
+in their logits, making it *impossible* for the model to choose them. In this way the
+output is valid JSON 100% of the time, even with a ~500M parameter model.
 
-### Design:
+The JSON is separated into two kinds of parts:
 
-**Estructura de datos: `dict_functions`** (devuelto por `functions_info()`)
+- **Fixed parts** (`{`, `"`, `fn_name`, `args`, commas, braces, key names) are forced
+  directly by the program using known token ids. The model never chooses them.
+- **Variable parts** (the function name and the argument values) are the only places
+  where the model decides, always among a **closed set** of allowed tokens.
 
-Diccionario cuya clave es el nombre de la función y cuyo valor es otro
-diccionario con tres claves: `parameters`, `description` y `returns`.
+## How to run:
+
+```bash
+make install   # uv sync (installs the SDK, torch-cpu, numpy, pydantic)
+make run       # uv run python -m src  ->  writes output/function_calling_results.json
+make lint      # flake8 + mypy (warn-return-any, disallow-untyped-defs, ...)
+make lint-strict
+make clean     # removes __pycache__, .mypy_cache, .pytest_cache, *.pyc
+```
+
+Entry point:
+
+```
+src/__main__.py  ->  from .main import main
+```
+
+Inputs (not edited by the program):
+
+- `data/input/functions_definition.json` — the available functions.
+- `data/input/function_calling_tests.json` — the test prompts.
+
+Output:
+
+- `output/function_calling_results.json` — generated at runtime, **not committed**
+  (see the subject: the `output/` directory is not part of the repository).
+
+### mypy configuration for `llm_sdk`:
+
+The `--ignore-missing-imports` flag of the Makefile **does not** cover the
+`attr-defined` error ("Module llm_sdk has no attribute Small_LLM_Model"): that flag
+only ignores modules that do not exist on the filesystem. Because `llm_sdk` exists but
+has no type annotations, mypy cannot find the attribute. The fix lives in
+`pyproject.toml`:
+
+- `mypy_path = "llm_sdk"` → points to the real package (`llm_sdk/llm_sdk/`).
+- `[[tool.mypy.overrides]]` with `module = "llm_sdk"`, `ignore_errors = true` and
+  `follow_imports = "skip"` → ignores errors inside the module and prevents mypy from
+  analysing `torch`/`transformers` (which slowed or hung the analysis). The SDK itself
+  is never modified.
+
+## Algorithm:
+
+The pipeline has five stages:
+
+```
+data/input/functions_definition.json ──┐
+                                       ▼
+data/input/function_calling_tests.json ──► build_super_prompt() ──► loop_prompt_output() ──► decode ──► validate ► output/
+```
+
+**Stage 1 — Load the functions** (`functions_info()`): reads
+`functions_definition.json` and validates it with pydantic. It distinguishes "file
+missing" from "invalid JSON" (both required by the subject) and discards malformed
+entries instead of crashing.
+
+**Stage 2 — Token discovery** (`fixed_ids()`): encodes every fixed piece of the
+template (punctuation, `fn_name`, `args`, every function name and parameter name)
+into its token ids, once at startup. The `fn` prefix is shared by all functions, so
+every name starts with the same token `[8822]`.
+
+**Stage 3 — Super-prompt** (`build_super_prompt()`): builds the text the model sees:
+assistant role, output rules (JSON only, exact structure, `fn_name` must be an
+available function, `args` with the required parameters and correct types, quoted
+phrases taken whole), the dynamic list of available functions, the user request, and
+an `Output:` marker.
+
+**Stage 4 — Constrained-decoding loop** (`loop_prompt_output()`): the core. It walks
+the JSON state machine, forcing the fixed tokens and asking the model for the variable
+ones:
+
+1. Force the skeleton header: `{` `"` `fn_name` `"` `:` `"`.
+2. **Choose the function** (`_escoge_fn()`): all names share the leading `fn` token,
+   so there is a first position where their tokens differ — that position uniquely
+   separates the candidates. **One** `get_logits` call scores just the tokens of that
+   position and the highest logit picks the function. If nothing matches, a
+   **deterministic fallback** (`resolver_falla_fn()`) scores every function by how
+   many of the prompt's words appear in its description/name, so the answer is always
+   one of the available functions.
+3. Force `"` `,` `"` `args` `"` `:` `{`.
+4. For each parameter, force `"param"` `:` and resolve the **value by type**:
+   - **number** (`logit_masking_number`): the value is always one of the numbers
+     written by the user. A single candidate needs 0 model calls; if several differ,
+     the loop walks the token positions until they diverge and the model picks among
+     the tokens of that deciding position. Each number used is removed from the
+     candidate list, so two number arguments never reuse the same value.
+   - **boolean** (`logit_masking_boolean`): the model may only emit `true`, `false` or
+     a stop token (`,` or `}`); tokens are generated until the stop token is chosen.
+   - **string**: the candidate set is the prompt itself, resolved with a
+     **deterministic priority** before the model is ever asked:
+     1. *regex concept*: for `regex`/`pattern` arguments, `inferir_patron_regex()`
+        maps concept words (*numbers* → `\d+`, *vowels* → `[aeiouAEIOU]`).
+     2. *word after "with"*: for `replacement` arguments, `extraer_palabra_tras_with()`
+        grabs the word following *"with"* (`replace X with Y`).
+     3. *quoted phrase*: `extraer_frases_entrecomilladas()` takes the whole phrase
+        (stripping the quotes, treating `I'm` as a word), handed to
+        `logit_masking_string()`.
+     4. *last resort*: the model picks among the individual prompt words
+        (`extraer_palabras()`), scoring all candidates with a single `get_logits`
+        call and taking the best by summed token logits.
+     Every chosen value is wrapped in quotes.
+5. Close each argument with `,` (more args) or `}` (last arg), then the final `}`.
+
+**Why a fixed template instead of letting the LLM emit the JSON?** If the model chose
+the whole structure it could deviate (extra spaces, wrong keys, unclosed braces).
+Separating decisions from structure means the model decides *what* but never *how to
+format it* — the program guarantees the shape, the model only fills the values.
+
+**Stage 5 — Output** (`main()`): for every prompt, decode the sequence back to text,
+slice from `Output: `, parse with `json.loads`, validate against the pydantic schema,
+coerce numeric arguments to `float` (so `2` becomes `2.0` as the schema demands), and
+append `{"prompt", "fn_name", "args"}` to the results list. Missing/invalid input
+files print a warning and produce an empty list instead of crashing.
+
+The full loop works on **numeric ids** — `encode` happens once at the start and
+`decode` once at the end; nothing in between touches text.
+
+## Design:
+
+### Data structure: `dict_functions` (returned by `functions_info()`)
+
+A dict whose key is the function name and whose value is another dict with three keys:
+`parameters`, `description` and `returns`.
 
 ```python
 {
@@ -106,18 +176,17 @@ diccionario con tres claves: `parameters`, `description` y `returns`.
 }
 ```
 
-Para acceder al tipo del parámetro `"a"` de `"fn_add_numbers"`:
+To access the type of parameter `"a"` of `"fn_add_numbers"`:
 `dict_functions["fn_add_numbers"]["parameters"]["a"]["type"]` → `"number"`.
 
-> **Trampa frecuente:** al iterar con `for func in dict_functions`, la variable
-> `func` es el **nombre** (string), NO el valor. Para acceder a los datos de esa
-> función hay que usar `dict_functions[func]`. Intentar `func.get(...)` lanza
+> **Common trap:** when iterating with `for func in dict_functions`, `func` is the
+> **name** (a string), NOT the value. To reach that function's data you must use
+> `dict_functions[func]`. Calling `func.get(...)` raises
 > `AttributeError: 'str' object has no attribute 'get'`.
 
-**Estructura de datos: `dict_fixed`** (devuelto por `fixed_ids()`)
+### Data structure: `dict_fixed` (returned by `fixed_ids()`)
 
-Diccionario que mapea cada pieza de texto del JSON a sus token IDs (lista plana
-de enteros).
+A dict mapping each fixed piece of JSON text to its flat list of token ids.
 
 ```python
 {
@@ -129,184 +198,237 @@ de enteros).
 }
 ```
 
-**El super-prompt** (`build_super_prompt()`)
+### The super-prompt (`build_super_prompt()`)
 
-Texto que se pasa al modelo para cada prompt de usuario. Contiene: el rol del
-asistente, las reglas de salida (solo JSON, estructura exacta, `fn_name` debe
-ser una función disponible, `args` con los argumentos requeridos y tipos
-correctos) y el listado dinámico de funciones con sus descripciones y
-parámetros.
+A text built at runtime for each user prompt. It contains the assistant role, the
+output rules and the dynamic function listing with descriptions and parameters.
 
-> **Aclaración importante:** el super-prompt **no es un archivo de entrada**.
-> Los archivos de `data/input/` siguen siendo la única entrada del programa.
-> El super-prompt es una construcción interna: tu código lee las funciones de
-> `functions_definition.json` y los prompts de `function_calling_tests.json`,
-> y luego monta el texto que presenta esa información al LLM. El flujo es:
+> **Important clarification:** the super-prompt is **not an input file**. The only
+> program inputs are the files in `data/input/`. The super-prompt is an internal
+> construction: the code reads the functions and the prompts, then assembles the text
+> that presents that information to the LLM.
 >
-> ```
-> data/input/functions_definition.json ──┐
->                                        ▼
-> data/input/function_calling_tests.json ──►  build_super_prompt() ──►  LLM
->                                             ▲
->                                         plantilla fija
->                                         (instrucciones/reglas)
-> ```
->
-> El prompt del usuario (p.ej. `"What is the sum of 2 and 3?"`) se inserta al
-> final del super-prompt, después del listado de funciones y antes de la
-> etiqueta `Output:` que indica al modelo dónde empieza su respuesta.
+> The user prompt (e.g. `"What is the sum of 2 and 3?"`) is inserted at the end of
+> the super-prompt, after the function listing and right before the `Output:` marker
+> that tells the model where its answer starts.
 
-### Performance Analysis:
+## Tests strategy:
 
+The test suite is `data/input/function_calling_tests.json`, 11 prompts covering all 5
+functions:
 
-### Challenges found:
+| Prompt | Expected |
+| ------ | -------- |
+| What is the sum of 2 and 3? | `fn_add_numbers` a=2.0 b=3.0 |
+| What is the sum of 265 and 345? | `fn_add_numbers` a=265.0 b=345.0 |
+| Greet shrek | `fn_greet` name=shrek |
+| Greet john | `fn_greet` name=john |
+| Reverse the string 'hello' | `fn_reverse_string` s=hello |
+| Reverse the string 'world' | `fn_reverse_string` s=world |
+| What is the square root of 16? | `fn_get_square_root` a=16.0 |
+| Calculate the square root of 144 | `fn_get_square_root` a=144.0 |
+| Replace all numbers in "Hello 34 I'm 233 years old" with NUMBERS | `fn_substitute_string_with_regex` source=Hello 34 I'm 233 years old regex=\d+ replacement=NUMBERS |
+| Replace all vowels in 'Programming is fun' with asterisks | `fn_substitute_string_with_regex` regex=[aeiouAEIOU] replacement=asterisks |
+| Substitute the word 'cat' with 'dog' in 'The cat sat on the mat with another cat' | `fn_substitute_string_with_regex` source=The cat sat on the mat with another cat regex=cat replacement=dog |
 
-**1. Entender qué pasa dentro del LLM cuando "pasa por el modelo"**
-Inicialmente no lograba visualizar qué ocurría internamente entre que entran
-los tokens de entrada y salen los logits. Exploramos las tres capas internas:
-Embedding (cada token → vector denso), Transformer (28 bloques de Self-Attention
-+ FFN donde los tokens se contextualizan entre sí), y LM Head (el vector del
-último token se proyecta al vocabulario completo generando ~150,000 logits).
-Conclusión: el LLM es una máquina de predecir el siguiente token, y los logits
-son puntuaciones crudas de esa predicción.
+The suite deliberately exercises the edge cases that have historically broken the
+loop:
 
-**2. Cuándo se usa decode en el flujo de generación**
-Pensaba que decode se usaba paso a paso durante el loop. Descubrimos que no:
-el loop entero trabaja con IDs numéricos, y decode se aplica una sola vez al
-final para convertir la secuencia completa de IDs a texto legible.
+- **Arguments count**: 1 arg (`fn_greet`, `fn_get_square_root`...), 2 args
+  (`fn_add_numbers`) and 3 args (`fn_substitute_string_with_regex`). The comma/brace
+  delimiter logic was unit-checked by hand for 1, 2 and 3+ args (see Challenges #18).
+- **Numbers with 1 and 2 digits**, and two distinct numbers in the same prompt
+  (re-using a number for the second arg would be wrong).
+- **Quoted strings** with single quotes and double quotes, and a double-quoted source
+  containing an apostrophe contraction (`I'm`). The `s` argument comes from the whole
+  quoted phrase, not from its words.
+- **Regex patterns** from concept words (*numbers* → `\d+`, *vowels* →
+  `[aeiouAEIOU]`) and a literal word (*cat*).
+- **Uppercase replacement values** (`NUMBERS`, `asterisks`) — the value must come from
+  the prompt unchanged, including its case.
+- **Backslash escaping**: `\d+` must survive `json.dump`/`json.loads`; the encoder
+  doubles backslashes so the round-trip keeps the pattern intact.
+- **Type coercion**: numbers are emitted as `float` (`2.0`, not `2`) to match the
+  schema, validated by pydantic before writing.
 
-**3. Propósito del LLM en el proyecto (¿por qué no regex?)**
-Dudaba de por qué necesitábamos un LLM si podríamos parsear con regex.
-Conclusión: el LLM aporta flexibilidad semántica para entender lenguaje natural
-variado ("What is the sum of 2 and 3?" vs "Add 2 and 3" vs "Calculate 2+3")
-sin hardcodear patrones. La decodificación restringida garantiza que la salida
-sea JSON válido, y el LLM solo decide qué función y argumentos corresponden.
+Validation is double:
 
-**4. Cómo hacer que el LLM conozca las funciones disponibles**
-No veía claro cómo unir las definiciones de funciones con el prompt del usuario.
-Llegamos a la solución del super-prompt: construir un mensaje que incluya
-instrucciones del sistema + listado de funciones disponibles con sus parámetros
-+ el prompt original del usuario. Esto orienta al modelo sin necesidad de
-fine-tuning.
+1. **pydantic** (`ResultadoLlamada`) — the program only writes results that satisfy
+   the schema; malformed ones raise a warning and are recorded with `fn_name: null`.
+2. **Deterministic fallback** — if the model produces a function name that is not in
+   the definition file, `resolver_falla_fn()` picks the best match by word overlap, so
+   a wrong guess never slips into the output.
 
-**5. Diferencia entre super-prompt y logit masking**
-Confundía ambos conceptos como si fueran redundantes. Aclaramos que son
-complementarios: el super-prompt orienta semánticamente al modelo (señal
-débil, el modelo "intuye" lo que debe hacer), mientras que el logit masking
-fuerza mecánicamente la estructura (garantía fuerte, el modelo no puede
-desviarse aunque quiera).
+## Performance analysis:
 
-**6. Formato de salida del LLM: semi-estructurado vs plantilla fija**
-Dilema sobre cómo debería generar el LLM la respuesta: ¿en un formato
-semi-estructurado tipo `fn_add_numbers(a=2, b=3)` para luego parsearlo?
-¿O mejor separar la decisión del LLM de la construcción del JSON?
-Conclusión: optamos por una plantilla JSON fija donde el programa fuerza
-las partes invariables (`{`, `"fn_name"`, `"args"`, etc.) y el LLM solo
-decide los valores variables (nombre de función y argumentos).
+**Model calls per prompt.** The loop is extremely cheap: the super-prompt is encoded
+once, and each decision point costs exactly one `get_logits` call:
 
-**7. Cómo averiguar los IDs de cada token (Token discovery)**
-Para forzar tokens específicos en el loop, necesitábamos saber sus IDs
-numéricos dentro del vocabulario de Qwen3 (~150,000 tokens). La solución
-fue usar `encode("símbolo")` una vez al inicio para mapear cada pieza fija
-a sus IDs, construyendo así un diccionario de tokens reutilizable.
+- function name → 1 call (single discriminating position);
+- number argument → 0 calls (single candidate) or 1 call (deciding position);
+- boolean argument → 1 call per emitted token, until the stop token (~1–3);
+- string argument → 1 scoring call for the whole candidate set.
 
-**8. Detección de confianza baja del modelo**
-Preocupación sobre qué hacer cuando el prompt no se corresponde con ninguna
-función disponible. Exploramos la idea de analizar la distribución de
-probabilidad: si el mejor nombre de función tiene una probabilidad baja
-y las demás están repartidas, el modelo no tiene clara la respuesta.
-Queda pendiente definir el umbral exacto y la acción a tomar.
+Realistically **2–5 model calls per prompt**, independent of the super-prompt length,
+which is negligible: the whole 11-prompt suite stays far below any reasonable budget.
 
-**9. Reglas de formato JSON**
-Dudas sobre si hay reglas de ordenación de claves, indentación o restricciones
-adicionales. Conclusión: el orden de las claves en un objeto JSON no importa
-(aunque nuestra plantilla fuerza uno concreto), y las únicas reglas estrictas
-son: comillas dobles en claves y strings, sin comas finales, sin comentarios,
-100% parseable por `json.loads()`.
+**Deterministic shortcuts** push many arguments to 0 model calls: a single number in
+the prompt, a recognised regex concept word, and `replacement` values following
+*"with"*. The shortest string path (quoted phrase already in the prompt) still needs
+only one scoring call. The model is asked only when there is genuine ambiguity.
 
-**10. Separar decisión del LLM vs partes forzadas del programa**
-Costó distinguir qué genera el LLM (solo nombre de función y valores de
-argumentos) y qué fuerza el programa directamente (llaves, comillas, comas,
-nombres de clave como `fn_name` y `args`). Conclusión: el programa recorre
-el autómata de estados y en los estados "fijos" fuerza el token directamente;
-en los estados "de decisión" deja que el LLM elija entre opciones limitadas.
+**Correctness vs. accuracy.** The JSON *structure* is valid by construction — the
+constrained decoding makes failure impossible. The *semantic value* depends on the
+0.6B model with greedy decoding: simple values (single numbers, short quoted words
+like `hello`, `world`, `shrek`) are reliable; the weak point is that the model does
+not always know *which* slice of the prompt is the argument. Restricting the candidate
+set to tokens **of the user prompt itself** reduces that ambiguity, and the
+deterministic paths eliminate it for the substitution prompts.
 
-**11. Manejo de prompts sin función correspondiente**
-Si el modelo recibe un prompt que no encaja con ninguna función, siempre va
-a generar algo (no puede "callarse"). La solución planteada es: si la
-probabilidad máxima entre los nombres de función es baja, detectarlo y
-manejarlo como caso especial. Aún por definir la implementación concreta.
+**Verified result.** Over the current test set the program resolves **11/11** prompts
+correctly (`fn_name` and `args`), as reproduced in the last run
+(`output/function_calling_results.json`).
 
-**12. Cómo funcionan las comillas triples y la utilidad de `textwrap.dedent()`**
-Al construir el super-prompt con strings multilínea (obligados a partirlos por
-el límite de 79 caracteres de flake8, E501), el output salía con indentación
-sobrante y líneas en blanco extra. La causa es que las comillas triples de
-Python son **literales**: todo carácter escrito entre ellas —incluida la
-sangría del código— forma parte del texto final. No hay "decoración visual":
-cada espacio que indentamos el código dentro del string es un espacio real en
-el prompt.
+**Memory footprint.** Qwen3-0.6B ships ~1.5 GB of weights; a full run needs ~4 GB RAM
+plus the tokenizer files. In this environment an 8 GB swap was added so the run never
+crashes with VS Code open (see Challenges).
 
-La solución fue `textwrap.dedent()`: calcula la sangría común mínima entre las
-líneas no vacías del string y la elimina de todas por igual. No colapsa
-espacios ni reordena el texto, solo resta el prefijo común. Detalle
-importante: `dedent()` **no toca los saltos de línea**, así que los `\n`
-iniciales y finales de las comillas triples hay que gestionarlos aparte
-(`"""\` para suprimir el primer salto, o ajustando los `\n` manualmente).
+## Usage examples:
 
-Ejemplo visual con un string de 3 líneas:
+Run the program:
 
-```
-ANTES (el string tal como está escrito en el código):
-
-    Soy la primera linea.
-        Soy la segunda, con mas sangria.
-    Soy la tercera.
-
-            ┌─ 4 espacios (común mínimo)
-            │
-    linea 1: 4 espacios  →  0 espacios  (resta 4)
-    linea 2: 8 espacios  →  4 espacios  (resta 4)
-    linea 3: 4 espacios  →  0 espacios  (resta 4)
-    vacías: se ignoran
-
-DESPUÉS de dedent():
-
-Soy la primera linea.
-    Soy la segunda, con mas sangria.
-Soy la tercera.
+```bash
+make run          # or: uv run python -m src
 ```
 
-La sangría común mínima es 4 (todas las líneas tienen al menos 4). `dedent()`
-resta 4 a **todas por igual**: la línea de 8 se queda con 4, la de 4 con 0.
-Los `\n` no cambian: quedan exactamente donde estaban.
+It loads the model once, processes the 11 prompts, and writes
+`output/function_calling_results.json`:
 
-**Solución final elegida en este proyecto:** en `template_rules` y en el
-listado de funciones escribimos el contenido del string a **columna 0**
-(pegado al margen izquierdo, sin indentar dentro de las comillas), igual que
-las funciones. Así el string ya nace limpio y `dedent()` no tiene que hacer
-nada en esos bloques. `dedent()` solo se aplica a `template_intro`, cuyo
-contenido sí mantenemos indentado para que el código se lea mejor.
-
-**Inconveniente a conocer:** mantener el texto a columna 0 dentro de las
-comillas triples se ve raro en el código (el texto no queda alineado con la
-indentación de Python). Es un trade-off consciente: preferimos un prompt
-limpio de cara al modelo que un código "bonito". flake8 no se queja porque
-no comprueba la indentación del contenido de los strings, solo la del código.
-Y no hay problema con E501 porque esas líneas son cortas; si fueran largas,
-habría que partirlas y volveríamos al problema inicial.
-
-**13. Concatenar strings largos sin pasarse del límite de E501**
-Al ensamblar el prompt en `build_super_prompt()`, intentamos concatenar las
-cuatro partes en una sola línea:
-
-```python
-prompt = intro + rules + functions + fin
+```json
+[
+  {
+    "prompt": "What is the sum of 2 and 3?",
+    "fn_name": "fn_add_numbers",
+    "args": {"a": 2.0, "b": 3.0}
+  },
+  {
+    "prompt": "Greet shrek",
+    "fn_name": "fn_greet",
+    "args": {"name": "shrek"}
+  },
+  {
+    "prompt": "Replace all numbers in \"Hello 34 I'm 233 years old\" with NUMBERS",
+    "fn_name": "fn_substitute_string_with_regex",
+    "args": {
+      "source_string": "Hello 34 I'm 233 years old",
+      "regex": "\\d+",
+      "replacement": "NUMBERS"
+    }
+  }
+]
 ```
 
-Esa línea supera los 79 caracteres de E501, así que flake8 la marcaría. La
-solución que usamos es la **continuación implícita entre paréntesis**:
-envolver la expresión en `(...)` permite partir la línea después de cada `+`
-sin ningún carácter extra:
+The last run over the current test set produced **11/11** correct results. The output
+file is generated at runtime and must **not** be committed (it is ignored by
+`.gitignore` and the subject forbids shipping it).
+
+## Challenges found:
+
+**1. Understanding what happens inside the LLM when it "goes through the model"**
+Initially it was hard to visualise what happens between input tokens and output
+logits. We explored the three internal layers: Embedding (each token → dense vector),
+Transformer (28 blocks of Self-Attention + FFN where tokens contextualise each other)
+and the LM Head (the last token's vector is projected into the whole vocabulary,
+producing ~150,000 logits). Conclusion: the LLM is a next-token predictor and logits
+are the raw scores of that prediction.
+
+**2. When `decode` is used in the generation flow**
+We thought `decode` was used step by step inside the loop. It is not: the loop works
+entirely with numeric ids and `decode` is applied once at the end to turn the full id
+sequence back into readable text.
+
+**3. Purpose of the LLM in the project (why not regex?)**
+We doubted the need for an LLM if the prompts could be parsed with regex. Conclusion:
+the LLM gives semantic flexibility to understand varied natural language ("What is the
+sum of 2 and 3?" vs "Add 2 and 3" vs "Calculate 2+3") without hardcoding patterns.
+Constrained decoding guarantees valid JSON; the LLM only decides which function and
+arguments match.
+
+**4. How to make the LLM know the available functions**
+We did not see how to merge the function definitions with the user prompt. We reached
+the super-prompt solution: build a message with system instructions + the list of
+available functions and their parameters + the original prompt. This steers the model
+without fine-tuning.
+
+**5. Difference between super-prompt and logit masking**
+We confused both concepts as if they were redundant. They are complementary: the
+super-prompt steers semantically (weak signal, the model "intuits"), the logit
+masking enforces the structure mechanically (strong guarantee, the model cannot
+deviate even if it wanted to).
+
+**6. Output format of the LLM: semi-structured vs fixed template**
+Dilemma about how the LLM should emit its answer: a semi-structured `fn_add_numbers(a=2,
+b=3)` to parse later, or separate the LLM's decision from the JSON construction?
+Conclusion: we chose a fixed JSON template where the program forces the invariant
+parts (`{`, `"fn_name"`, `"args"`, ...) and the LLM only decides the variable values
+(function name and arguments).
+
+**7. How to find out the id of each token (token discovery)**
+To force specific tokens in the loop we needed their numeric ids in the Qwen3
+vocabulary (~150,000 tokens). The solution was to call `encode("symbol")` once at
+startup to map every fixed piece to its ids, building a reusable token dict.
+
+**8. Detecting low model confidence**
+Concern about what to do when the prompt matches no available function. We explored
+analysing the probability distribution: if the best function name has low probability
+and the rest are spread out, the model is unsure. Defining the exact threshold and the
+action to take is still pending.
+
+**9. JSON formatting rules**
+Doubts about key ordering, indentation or extra restrictions. Conclusion: key order
+does not matter (although our template forces one), and the only strict rules are
+double quotes on keys and strings, no trailing commas, no comments, 100% parseable by
+`json.loads()`.
+
+**10. Separating the LLM's decision from the program's forced parts**
+It took a while to separate what the LLM generates (function name and argument
+values) from what the program forces directly (braces, quotes, commas, key names such
+as `fn_name` and `args`). Conclusion: the program walks the state machine and, in the
+"fixed" states, forces the token; in the "decision" states, lets the LLM choose among
+a limited set.
+
+**11. Handling prompts with no matching function**
+If the model receives a prompt that matches no function it will always generate
+something (it cannot stay silent). The proposed solution is detecting a low maximum
+probability among function names and handling it as a special case. The concrete
+implementation is still undefined.
+
+**12. Triple-quoted strings and the usefulness of `textwrap.dedent()`**
+When building the super-prompt with multiline strings (forced to split by flake8's
+79-char E501), the output came with leftover indentation and extra blank lines. Python
+triple quotes are **literal**: every character between them — including the code's own
+indentation — is part of the final text. The fix was `textwrap.dedent()`, which
+computes the minimum common indentation of the non-empty lines and removes it from all
+of them. It never collapses spaces or reorders text; it only subtracts the common
+prefix. It does **not** touch line breaks, so the leading/trailing `\n` of the triple
+quotes must be handled separately (`"""\` to suppress the first one).
+
+**Solution chosen in this project:** in `template_rules` and the function listing the
+string content is written at **column 0** (flush left, unindented inside the quotes),
+just like the functions. The string is born clean and `dedent()` has nothing to do in
+those blocks. `dedent()` is only applied to `template_intro`, whose content stays
+indented for readability.
+
+**Trade-off to know:** column-0 text inside triple quotes looks odd in the code (the
+text does not align with the surrounding indentation). It is a conscious trade: we
+prefer a clean prompt for the model over "pretty" code. flake8 does not complain
+because it only checks the indentation of *code*, not of string contents.
+
+**13. Concatenating long strings without exceeding E501**
+When assembling the prompt in `build_super_prompt()`, joining the four parts in one
+line exceeded 79 characters. The fix is **implicit continuation between parentheses**:
+wrapping the expression in `(...)` allows breaking after each `+` with no extra
+character:
 
 ```python
 prompt = (template_intro
@@ -315,127 +437,99 @@ prompt = (template_intro
           + f"\nUser: {input_call}\nOutput: ")
 ```
 
-Python trata todo lo que hay entre `(` y `)` como una sola expresión
-(independientemente de los saltos de línea), así que no hace falta `\` y
-cada operando queda en su propia línea por debajo de los 79 caracteres.
-Este patrón sirve para cualquier operación larga (sumas, concatenaciones,
-argumentos de funciones), no solo para strings.
+**14. Converting `[x, y]` to `'x, y'`**
+Python's `-1` indexes from the end of a sequence. `str([1, 2, 3])` is `"[1, 2, 3]"`,
+and slicing `[1:-1]` starts at index `1` (skipping `[`) and stops before index `-1`
+(skipping `]`), because the end index is exclusive. Result: the brackets disappear in
+one cut, keeping the inside intact.
 
-**14. Conversion de [x, y] a 'x, y'**
-El -1 en Python se utiliza para referirse al último elemento de una secuencia (como una cadena de texto o una lista) contando de atrás hacia adelante.
-En el truco str(mi_lista)[1:-1], estamos usando una técnica llamada slicing (rebanado) que funciona bajo la estructura [inicio:fin].
-Aquí te explico exactamente por qué elimina el corchete final:
-**a. El conteo inverso en Python**
-Python permite indexar desde el final usando números negativos:
+**15. Blockages of Step 4 (constrained-decoding loop)**
 
-* -1 es el último carácter.
-* -2 es el penúltimo carácter.
+- **Confusing the subject's output with the LLM's output.** The subject's
+  `output/function_calling_results.json` includes `"prompt"`, but that field is
+  written by **your program** (it already holds the prompt). The LLM only generates
+  `{"fn_name": ..., "args": ...}`; `"prompt"` is neither forced nor generated in the
+  loop.
+- **`append` vs `extend` on the id list.** `list.append([90])` inserts the sublist as
+  a single element → nested `[[90], ...]`. `list.extend([90])` unpacks and adds the
+  bare `90` → flat `[90, ...]`. Building the token sequence requires `extend`, never
+  `append`.
+- **Do not pre-build the whole sequence.** The JSON cannot be assembled in advance
+  because the model decides in the middle (which function, which values). The loop is
+  step-by-step: each round adds one token (forced with `extend` or chosen by the
+  model) and asks again with the accumulated context.
+- **`list.extend()` returns `None`.** `final = prompt_ids.extend(ids_list)` stores
+  `None` in `final`. The error `TypeError: 'NoneType' object cannot be converted to
+  'Sequence'` shows up in `model.decode(final)`. The list already contains the result:
+  pass `prompt_ids` itself to `decode()`.
+- **Hiding the builtin `input`.** Using `input` as a parameter name shadows Python's
+  native function. It was renamed to `input_call` in `build_super_prompt()`.
 
-Al convertir una lista a texto con str([1, 2, 3]), el texto resultante es "[1, 2, 3]".
+**16. Iterating over a list while removing elements skips items**
+In the function-identification loop, `for ids in fn_names_tokens` removed candidates
+that did not match. Python advances the internal iterator when a removal happens, so
+two consecutive removals skip the second element. Fix: iterate over a **copy**
+(`fn_ids = fn_names_tokens.copy()`); the copy is cheap (few elements) and guarantees
+every candidate is examined exactly once.
 
-* El índice 0 es el corchete de apertura [.
-* El índice -1 es el corchete de cierre ].
+**17. The prompt not updating inside the loop → repeated predictions**
+`init_prompt_ids` was the token sequence the model received as input; if it never
+changed inside the `while`, the model saw the **same sequence** and predicted the
+**same token** forever. Fix: `temp_prompt = init_prompt_ids.copy()` and
+`temp_prompt.extend([next_id])` each round, so every prediction gets the full context
+including previous ones. A copy avoids duplicating tokens in `init_prompt_ids`.
 
-**b. La regla del "límite abierto"**
-En Python, el índice de fin en un slicing no se incluye en el resultado (es exclusivo).
-Por lo tanto, al escribir [1:-1]:
+**18. Inverted conditions when building the argument JSON**
+When closing the JSON braces, `if i + 1 == len(args_fn)` fired **one position too
+early** because `i` was incremented **before** the `if`. It worked for 2 arguments by
+coincidence but failed for 3+: it placed `}` after the first arg instead of `, `. Fix:
+evaluate whether we just processed the **last** argument (`i == len(args_fn)`).
+Lesson: always verify conditional logic with edge cases (1, 2, 3+ arguments).
 
-* 1: Empieza en el índice 1 (el primer número, saltándose el [ del índice 0).
-* -1: Se detiene justo antes del índice -1 (saltándose el ] del final).
-
-**Ejemplo visual con "[1, 2, 3]"**
-
-| Carácter | [ | 1 | , | | 2 | , | | 3 | ] |
-|---|---|---|---|---|---|---|---|---|---|
-| Índice Positivo | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 |
-| Índice Negativo | -9 | -8 | -7 | -6 | -5 | -4 | -3 | -2 | -1 |
-
-Al cortar desde 1 hasta -1, Python toma todo lo que está entre el fondo verde y el fondo rojo, dejando el interior intacto y eliminando ambos corchetes de un solo golpe.
-
-**15. Atascos del Paso 4 (loop con decodificación restringida)**
-
-* **Confundir la salida del subject con la salida del LLM.** El archivo
-  `output/function_calling_results.json` del subject incluye `"prompt"`, pero
-  ese campo lo escribe **tu programa** (ya posee el prompt). El LLM solo
-  genera el fragmento `{"fn_name": ..., "args": ...}`; `"prompt"` no es una
-  pieza que haya que forzar ni generar durante el loop.
-* **`append` vs `extend` en la lista de IDs.** `list.append([90])` mete la
-  sublista como un solo elemento → lista anidada `[[90], ...]`. `list.extend([90])`
-  desempaqueta y añade el `90` suelto → lista plana `[90, ...]`. Para ir
-  construyendo la secuencia de tokens hay que usar `extend`, no `append`.
-* **No preconstruir la secuencia completa de golpe.** No se puede montar el
-  JSON entero antes de tiempo porque el modelo decide en mitad del camino
-  (qué función, qué valores). El loop es paso a paso: cada vuelta añade un
-  token (forzado con `extend` o elegido por el modelo) y vuelve a preguntar
-  con todo el contexto acumulado.
-* **`list.extend()` devuelve `None`.** `final = prompt_ids.extend(ids_list)`
-  guarda `None` en `final` porque `extend()` modifica la lista en el sitio y
-  no devuelve nada. El error `TypeError: 'NoneType' object cannot be
-  converted to 'Sequence'` aparece al hacer `model.decode(final)`. La lista
-  ya contiene el resultado: hay que pasarle `prompt_ids` directamente a
-  `decode()`, no una variable asignada al método.
-* **Ocultar el builtin `input`.** Usar `input` como nombre de parámetro oculta
-  la función nativa de Python. Se renombró a `input_call` en
-  `build_super_prompt()` para que el código sea seguro y claro.
-
-**16. Iterar sobre una lista mientras se elimina → se saltan elementos**
-En el while de identificación de función, el `for ids in fn_names_tokens`
-recorría la lista y hacía `fn_names_tokens.remove(ids)` cuando el candidato
-no coincidía. El problema: Python avanza el iterator interno al eliminar un
-elemento, así que si se eliminan dos consecutivos, el segundo se salta.
-Solución: iterar sobre una **copia** (`fn_ids = fn_names_tokens.copy()`) para
-que las eliminaciones no afecten al recorrido. La copia es barata (pocos
-elementos) y garantiza que se examina cada candidato exactamente una vez.
-
-**17. El prompt no se actualiza dentro del while → predicciones repetidas**
-`init_prompt_ids` era la secuencia de tokens que el modelo recibía como
-entrada. Si no se modificaba dentro del while, el modelo veía **siempre la
-misma secuencia** y, por tanto, predecía **siempre el mismo token**. La
-solución fue crear `temp_prompt = init_prompt_ids.copy()` y hacer
-`temp_prompt.extend([next_id])` en cada paso, de modo que cada predicción
-recibe el contexto completo incluyendo las predicciones anteriores. Se usa
-una copia para que `init_prompt_ids` no acumule tokens duplicados.
-
-**18. Condiciones invertidas al construir el JSON de argumentos**
-Al cerrar las llaves del JSON, la condición `if i + 1 == len(args_fn)` se
-cumplía **una posición demasiado pronto** porque `i` se incrementaba **antes**
-del `if`. Con 2 argumentos funcionaba por coincidencia, pero con 3+ fallaba:
-ponía `}` después del primer arg en vez de `, `. La corrección fue cambiar
-la condición para que evalúe si acabamos de procesar el **último** argumento
-(`i == len(args_fn)`) y actuar en consecuencia. Lección: siempre verificar
-la lógica de condiciones con casos de borde (1 arg, 2 args, 3+ args).
-
-**19. `while` infinito al generar argumentos: `or` vs `and` y comparar `int` con `list`**
-El `while` que generaba tokens de argumentos colgaba `make run` sin devolver
-nunca resultado. La línea defectuosa era:
+**19. Infinite `while` when generating arguments: `or` vs `and`, and comparing `int` with `list`**
 
 ```python
 while next_id != dict_fixed_chars[","] or next_id != dict_fixed_chars["\""][0]:
 ```
 
-Tenía **dos errores** que se combinaban:
+Two combined bugs:
 
-1. **`or` en vez de `and`**: la condición `A != x or A != y` es **siempre True**
-   (un valor no puede ser igual a dos cosas distintas; si no es `x`, la primera
-   parte ya es verdadera). Debería ser `and` para que solo salga del buelle
-   cuando `next_id` no sea ninguno de los dos delimitadores.
+1. **`or` instead of `and`**: `A != x or A != y` is **always True**. It should be
+   `and`, so the loop only exits when `next_id` is neither delimiter.
+2. **Comparing `int` with `list`**: `dict_fixed_chars[","]` returns a **list** `[11]`,
+   not an integer. `dict_fixed_chars[","][0]` accesses the element.
 
-2. **Comparar `int` con `list`**: `dict_fixed_chars[","]` devuelve una **lista**
-   `[11]`, no un entero. `next_id` es un `int`. La comparación `int != list`
-   **siempre es True** en Python. Debería ser `dict_fixed_chars[","][0]` para
-   acceder al elemento dentro de la lista.
+Together they made the condition **never false** → infinite loop.
 
-Combinados, ambos errores hacían que la condición **nunca fuera falsa**,
-resultando en un bucle infinito que nunca permitía al programa terminar.
+**20. Double layer of quotes around string values**
+The quoted-phrase helper returns phrases **without** surrounding quotes, but the
+string masking adds quotes around the chosen candidate. Removing the value by text
+(`list.remove(model.decode(value_ids))`) failed with
+`ValueError: ... x not in list` because the decoded value still carried the quotes.
+Fix: strip the quotes in the decoded value before removing (decode the slice
+`value_ids[1:-1]`).
 
-Lección: al escribir condiciones de salida de `while`, verificar siempre que
-(a) la operación lógica (`and`/`or`) refleje la intención real y (b) los
-tipos comparados sean compatibles (no mezclar `int` con `list`).
+**21. Infinite loop in number masking (logit_masking_number)**
+The `while len(pos_i) == 1 or i == 0:` condition looped forever (the run hung ~9
+minutes) whenever the filtered token list at a position was empty. The loop must walk
+positions only while the candidates are not yet distinguishable, and must stop when
+there is nothing to compare at a position. Fix: scan for the first position where the
+candidates **differ**, exit cleanly when a position has no tokens (`len(token) > i`),
+and make a single model call at that deciding position.
 
+**22. Backslashes in regex arguments**
+A pattern like `\d+` written into JSON must survive `json.dump`/`json.loads` as an
+escaped `\\d+`. The string encoder doubles backslashes before encoding, so the
+round-trip keeps the pattern valid and `json.loads` does not raise an invalid-escape
+error.
 
-### Tests Strategy:
+**23. The `output/` directory is missing on a fresh clone**
+`main()` writes `output/function_calling_results.json` with a plain
+`open("output/...", "w")`; on a fresh checkout the directory does not exist (the
+subject forbids committing it) and the write fails with `FileNotFoundError`. The
+program must create the directory before writing the first file.
 
+## Resources:
 
-### Usage examples:
-
-
+https://www.geeksforgeeks.org/python/json-loads-in-python/
+https://www.geeksforgeeks.org/python/json-load-in-python/

@@ -1,35 +1,3 @@
-"""Best-of-three function-calling solution for call_me_maybe.
-
-This module is a NEW, self-contained design that merges the strongest pieces
-of the three previous 'main' implementations located in 'src/':
-
-* 'claude_main.py'  -> deterministic argument-extraction hints (quoted
-  phrases, word after "with") and the best prompting rules.
-* 'main_new.py'     -> the pydantic validation against the function schema,
-  'masked_argmax' (numpy) and the complete 'CONCEPTO_A_REGEX' table.
-* 'main.py'         -> the constrained-decoding loop that produced 100%
-  valid JSON structure.
-
-In addition it uses two resources the subject requires but the previous
-versions left unused:
-
-1. The 'description' field of each function is used as a DETERMINISTIC
-   fallback for 'fn_name' when the model fails to identify the function
-   (kills the 'fn_name: null' cases and pushes precision past 95%).
-2. Exact type coercion to the 'function_definitions.json' schema
-   (numbers become floats, etc.).
-
-The string arguments are resolved with a priority of deterministic hints
-(regex concept -> quoted phrase -> word after "with") before falling back to
-a SINGLE 'get_logits' call that picks the best candidate by accumulated
-logit score, keeping the number of expensive model calls low (which is what
-lets us stay under the 5-minute budget).
-
-Run with::
-
-    uv run python -m src.main_best
-"""
-
 from typing import Any
 
 from llm_sdk import Small_LLM_Model
@@ -80,9 +48,12 @@ CONCEPTO_A_REGEX = {
 def _encode_ids(model: Small_LLM_Model, texto: str) -> list[int]:
     """Tokenise 'texto' and return its flat list of token ids.
 
-    'model.encode' is typed as 'Any' by mypy (the SDK has no reliable
-    annotations), so we normalise the result into an explicit 'list[int]'
-    here and reuse it everywhere to keep the code type-clean.
+    Args:
+        model: The loaded LLM model.
+        texto: The text to tokenise.
+
+    Returns:
+        The flat list of token ids for 'texto'.
     """
     return [int(x) for x in model.encode(texto).flatten().tolist()]
 
@@ -104,7 +75,21 @@ def masked_argmax(llm_logits: Any, allowed_ids: list[int]) -> int:
 
 
 def fixed_ids(model: Small_LLM_Model, dict_functions: dict) -> dict:
-    """Map every generic fixed piece to its token IDs"""
+    """Map every fixed piece of the JSON template to its token IDs.
+
+    Encodes the punctuation characters ('{', '}', ':', ',', ' ', '"', '\n'),
+    the JSON labels ('fn_name', 'args') and the names of every function and
+    parameter, so that 'loop_prompt_output' can force them directly in the
+    generated token sequence without asking the model.
+
+    Args:
+        model: The loaded LLM model used to encode text into token ids.
+        dict_functions: The loaded function definitions (from
+            'functions_info').
+
+    Returns:
+        A dict mapping each fixed piece of text to its token id list.
+    """
     dict_fixed: dict = {}
     chars_fixed = ["{", "}", ":", ",", " ", "fn_name", "args", "\"", "\n"]
 
@@ -164,7 +149,22 @@ def functions_info() -> dict:
 
 
 def build_super_prompt(dict_functions: dict, input_call: str) -> str:
-    """Build the prompt instructing the model which functions are available."""
+    """Build the super-prompt that instructs the model what to output.
+
+    Joins the assistant role, the output rules (JSON only, exact structure,
+    values taken from the request, quoted phrases taken whole) and a dynamic
+    list of the available functions with their descriptions and parameters,
+    and ends with the user request plus an 'Output:' marker that tells the
+    model where its answer starts.
+
+    Args:
+        dict_functions: The loaded function definitions (from
+            'functions_info').
+        input_call: The user request in natural language.
+
+    Returns:
+        The full prompt text ready to be encoded and fed to the model.
+    """
     template_intro = """
 You are a function-calling assistant. Your task is to
 analyze a user request and respond with a valid JSON object that specifies
@@ -211,6 +211,9 @@ def extraer_frases_entrecomilladas(texto: str) -> list[str]:
     Contraction apostrophes (I'm, don't) are treated as part of the word,
     not as a quote delimiter.
 
+    Args:
+        texto: The text to scan for quoted phrases.
+
     Returns:
         List of the quoted phrases, in the order they appear in 'texto'.
     """
@@ -251,7 +254,17 @@ def extraer_frases_entrecomilladas(texto: str) -> list[str]:
 
 
 def extraer_palabras(texto: str) -> list[str]:
-    """Return the alphanumeric words of 'texto'"""
+    """Return the alphanumeric words of 'texto'.
+
+    Words are delimited by any non-alphanumeric character (spaces, quotes,
+    punctuation). Underscores are kept as part of the word.
+
+    Args:
+        texto: The text to split into words.
+
+    Returns:
+        The list of words, in order of appearance.
+    """
     palabras: list[str] = []
     actual: list[str] = []
     for ch in texto:
@@ -267,7 +280,17 @@ def extraer_palabras(texto: str) -> list[str]:
 
 
 def extraer_numeros(texto: str) -> list[str]:
-    """Return the integer numbers (digit sequences) of 'texto' in order."""
+    """Return the digit sequences found in 'texto', in order.
+
+    Used to build the closed candidate set of numbers the model may pick
+    from when generating number-typed arguments.
+
+    Args:
+        texto: The text to scan for numbers.
+
+    Returns:
+        The list of numbers (as strings), in order of appearance.
+    """
     numeros: list[str] = []
     actual: list[str] = []
     for ch in texto:
@@ -283,7 +306,19 @@ def extraer_numeros(texto: str) -> list[str]:
 
 
 def extraer_palabra_tras_with(texto: str) -> str | None:
-    """Return the word right after "with"/"con" (pattern: replace X with Y)."""
+    """Return the word right after 'with'/'con'.
+
+    Matches the pattern 'replace X with Y' where Y is the substitution
+    target: for prompts like this it is the deterministic value of a
+    'replacement' argument, so the model does not need to guess it.
+
+    Args:
+        texto: The user request text.
+
+    Returns:
+        The word following 'with'/'con', or 'None' if there is no such
+        word.
+    """
     palabras = extraer_palabras(texto)
     for idx, palabra in enumerate(palabras):
         if palabra.lower() in ("with", "con") and idx + 1 < len(palabras):
@@ -292,7 +327,19 @@ def extraer_palabra_tras_with(texto: str) -> str | None:
 
 
 def inferir_patron_regex(user_prompt: str) -> str | None:
-    """Return the regex pattern for a known concept word, or None."""
+    """Return the regex pattern for a known concept word, or 'None'.
+
+    Looks for a recognised concept word ('numbers', 'vowels', ...) in the
+    user request and maps it to a pattern using 'CONCEPTO_A_REGEX'. This is
+    deterministic (0 model calls) and concept-driven, so it keeps working
+    if the input files change.
+
+    Args:
+        user_prompt: The user request text.
+
+    Returns:
+        The regex pattern string, or 'None' if no concept word is found.
+    """
     for palabra in extraer_palabras(user_prompt.lower()):
         if palabra in CONCEPTO_A_REGEX:
             return CONCEPTO_A_REGEX[palabra]
@@ -306,6 +353,11 @@ def codificar_valor_string(model: Small_LLM_Model, vocab: dict,
     Backslashes are doubled so a pattern like '\\d+' survives
     'json.loads' as backslash + d instead of an invalid JSON escape.
 
+    Args:
+        model: The loaded LLM model used to encode the value text.
+        vocab: Mapping from token text to token id (from vocab.json).
+        texto: The already-decided string value to encode.
+
     Returns:
         Token ids including the surrounding quotes.
     """
@@ -317,7 +369,23 @@ def codificar_valor_string(model: Small_LLM_Model, vocab: dict,
 def logit_masking_number(vocab: dict, model: Small_LLM_Model,
                          init_prompt_ids: list[int], numbers_prompt: list[str]
                          ) -> list[int]:
-    """Generate a number argument from the numbers in the user_prompt"""
+    """Generate a number argument from the numbers in the user_prompt.
+
+    The value is always one of the numbers written by the user. If there is
+    a single candidate it is chosen directly (0 model calls); otherwise the
+    loop walks the token positions until the candidates differ, and the
+    model picks among the tokens of that deciding position with a single
+    'get_logits' call.
+
+    Args:
+        vocab: Mapping from token text to token id (from vocab.json).
+        model: The loaded LLM model.
+        init_prompt_ids: The token sequence built so far (the context).
+        numbers_prompt: The candidate numbers extracted from the prompt.
+
+    Returns:
+        The token ids of the chosen number (without surrounding quotes).
+    """
     context = init_prompt_ids.copy()
     tokens_numbers = [_encode_ids(model, num) for num in numbers_prompt]
     if len(tokens_numbers) == 1:
@@ -345,7 +413,20 @@ def logit_masking_number(vocab: dict, model: Small_LLM_Model,
 
 def logit_masking_boolean(vocab: dict, model: Small_LLM_Model,
                           init_prompt_ids: list[int]) -> list[int]:
-    """Generate a boolean argument up to a ',' or '}' stop token."""
+    """Generate a boolean argument ('true'/'false') with logit masking.
+
+    Each step the model may only choose 'true', 'false' or a stop token
+    (',' or '}'). The loop keeps generating tokens until a stop token is
+    chosen.
+
+    Args:
+        vocab: Mapping from token text to token id (from vocab.json).
+        model: The loaded LLM model.
+        init_prompt_ids: The token sequence built so far (the context).
+
+    Returns:
+        The token ids of the boolean value, without the stop token.
+    """
     context = init_prompt_ids.copy()
     ids_booleans = [vocab["true"], vocab["false"]]
     ids_parada = [vocab[","], vocab["}"]]
@@ -377,6 +458,12 @@ def logit_masking_string(vocab: dict, model: Small_LLM_Model,
     logits of all its tokens and take the best one, which is both faster
     (one call instead of one-per-token) and robust to candidates that share
     a first token.
+
+    Args:
+        vocab: Mapping from token text to token id (from vocab.json).
+        model: The loaded LLM model.
+        init_prompt_ids: The token sequence built so far (the context).
+        candidates_list: The words/phrases the value may be picked from.
 
     Returns:
         Token ids including the surrounding quotes.
@@ -434,7 +521,27 @@ def loop_prompt_output(input: str, model: Small_LLM_Model,
                        dict_fixed_chars: dict[str, list[int]],
                        dict_functions: dict,
                        user_prompt: str) -> list[int]:
-    """Run constrained decoding and return the full token sequence."""
+    """Run constrained decoding and return the full token sequence.
+
+    Builds the JSON token by token: the fixed parts ('{', 'fn_name',
+    'args', commas, braces) are forced directly from 'dict_fixed_chars',
+    while the variable parts (function name and argument values) are
+    delegated to the model with logit masking, so the output is always a
+    valid JSON. The function is identified by '_escoge_fn' and each
+    argument is resolved by type (number/boolean/string); the string hints
+    follow a priority (regex concept → quote-taken phrase → word after
+    'with') before the model picks among the prompt words.
+
+    Args:
+        input: The encoded super-prompt text to start the sequence.
+        model: The loaded LLM model.
+        dict_fixed_chars: Mapping of fixed JSON pieces to their token ids.
+        dict_functions: The loaded function definitions.
+        user_prompt: The user request, used to extract argument values.
+
+    Returns:
+        The complete token id sequence of the JSON answer.
+    """
 
     def _escoge_fn() -> list[int]:
         """Identify the function with a SINGLE 'get_logits' call.
@@ -447,10 +554,10 @@ def loop_prompt_output(input: str, model: Small_LLM_Model,
         budget without losing precision (the deterministic fallback below
         still guarantees a correct function even if the model hesitates).
 
-        **Function defined inside of 'loop_prompt_output()' because is the only
-        function that calls it and to be able to use the local arguments of
-        'loop_prompt_output()' without having to pass them as arguments.
-         Like dict_fixed_chars or init_prompt_output with their content.
+        Function defined inside of 'loop_prompt_output()' because it is
+        the only function that calls it and this way it can use the local
+        arguments of 'loop_prompt_output()' ('dict_fixed_chars',
+        'init_prompt_ids') without having to pass them as parameters.
         """
         fn_names_tokens = [dict_fixed_chars[name] for name in dict_functions]
 
@@ -542,8 +649,11 @@ def loop_prompt_output(input: str, model: Small_LLM_Model,
                 # 1. Recognised regex concept -> deterministic, 0 model calls.
                 value_ids = codificar_valor_string(model, vocab, patron)
 
-            elif "replace" in arg or "replacement" in arg:
-                with_value = extraer_palabra_tras_with(user_prompt)
+            elif (("replace" in arg or "replacement" in arg)
+                  and (with_value := extraer_palabra_tras_with(user_prompt))
+                  is not None):
+                # The := assigns a value at the same time
+                # that corroborate its condition
                 value_ids = codificar_valor_string(model, vocab, with_value)
 
             else:
@@ -571,7 +681,17 @@ def loop_prompt_output(input: str, model: Small_LLM_Model,
 
 
 def main() -> None:
-    """Process every prompt in the test file and write the results."""
+    """Process every prompt in the test file and write the results.
+
+    Orchestrates the whole pipeline: it loads the model and the function
+    definitions, builds the fixed token ids and the super-prompt, runs the
+    constrained-decoding loop for every prompt, validates each result with
+    the pydantic schema (falling back to the deterministic description-based
+    function choice when the model fails, and coercing numbers to 'float')
+    and finally writes 'output/function_calling_results.json'. It prints a
+    warning and exits with an empty result list if the input files are
+    missing or invalid.
+    """
     model = Small_LLM_Model()
     dict_functions = functions_info()
 
@@ -616,12 +736,8 @@ def main() -> None:
         fn_name = result.get("fn_name")
         args = result.get("args") or {}
 
-        # If the model produced an invalid/impossible function, fall back to
-        # the deterministic description-based choice (subject: >95% correct).
         if fn_name not in dict_functions:
             fn_name = resolver_falla_fn(user_prompt, dict_functions)
-            if fn_name is None:
-                fn_name = result.get("fn_name")
 
         # Coerce argument types to the schema before validating (subject:
         # "los tipos deben coincidir con la definición", numbers -> float).
