@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Entorno virtual
+.venv/
+
+# Linting cache
+.mypy_cache/
+.pytest_cache/
+
+# Output del programa
+output/

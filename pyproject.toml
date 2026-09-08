@@ -1,0 +1,35 @@
+[project]
+name = "call-me-maybe-janette"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "flake8>=7.3.0",
+    "llm-sdk",
+    "mypy>=2.2.0",
+    "numpy>=2.2.6",
+    "pydantic>=2.13.4",
+]
+
+[tool.uv.workspace]
+members = [
+    "llm_sdk",
+    "src",
+]
+
+[tool.uv.sources]
+llm-sdk = { workspace = true }
+torch = { index = "pytorch-cpu" }
+
+[[tool.uv.index]]
+url = "https://download.pytorch.org/whl/cpu"
+name = "pytorch-cpu"
+
+[tool.mypy]
+mypy_path = "llm_sdk"
+[[tool.mypy.overrides]]
+module = "llm_sdk"
+ignore_missing_imports = true
+ignore_errors = true
+follow_imports = "skip"
